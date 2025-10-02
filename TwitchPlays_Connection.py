@@ -16,6 +16,7 @@ import os
 import json
 import concurrent.futures
 import traceback
+import threading
 
 MAX_TIME_TO_WAIT_FOR_LOGIN = 3
 YOUTUBE_FETCH_INTERVAL = 1
@@ -340,3 +341,133 @@ class YouTube:
                         msg['message'] += part['emoji']['emojiId']
                 messages.append(msg)
         return messages
+
+class Kick:
+    # Minimal Kick chat support using Pusher Channels
+    def __init__(self):
+        self.session = None
+        self.channel_name = ''
+        self.chatroom_id = None
+        self.messages = []
+        self._lock = threading.Lock()
+        self._connected = False
+        self._pusher = None
+        self._pusher_channel = None
+        self._pusher_key = None
+        self._pusher_cluster = None
+        self._auth_endpoint = None
+        self._headers = {}
+
+    def reconnect(self, delay):
+        time.sleep(delay)
+        self.kick_connect(self.channel_name, self._pusher_key, self._pusher_cluster, self._auth_endpoint, self._headers.get('Cookie', None), self._headers.get('X-CSRF-TOKEN', None))
+
+    def kick_connect(self, channel, pusher_key, pusher_cluster='mt1', auth_endpoint='https://kick.com/broadcasting/auth', cookies=None, csrf_token=None):
+        self.channel_name = channel
+        self._pusher_key = pusher_key
+        self._pusher_cluster = pusher_cluster
+        self._auth_endpoint = auth_endpoint
+
+        # Prepare session for REST and auth
+        self.session = requests.Session()
+        self.session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36'
+        if cookies:
+            if isinstance(cookies, dict):
+                requests.utils.add_dict_to_cookiejar(self.session.cookies, cookies)
+                cookie_header = '; '.join([f"{k}={v}" for k, v in cookies.items()])
+            else:
+                # Assume cookie header string
+                cookie_header = str(cookies)
+                # Also try to populate session cookies roughly
+                try:
+                    for part in cookie_header.split(';'):
+                        if '=' in part:
+                            k, v = part.strip().split('=', 1)
+                            self.session.cookies.set(k, v)
+                except Exception:
+                    pass
+            self._headers['Cookie'] = cookie_header
+        if csrf_token:
+            self._headers['X-CSRF-TOKEN'] = csrf_token
+
+        # Fetch channel info to get chatroom id
+        print('Connecting to Kick...')
+        info_res = self.session.get(f'https://kick.com/api/v2/channels/{self.channel_name}')
+        if not info_res.ok:
+            print(f"Couldn't load Kick channel info ({info_res.status_code} {info_res.reason}). Is the channel name correct? {self.channel_name}")
+            time.sleep(5)
+            return
+        try:
+            data = info_res.json()
+            # chatroom id may be nested
+            self.chatroom_id = (data.get('chatroom') or {}).get('id') or data.get('chatroom_id')
+        except Exception:
+            traceback.print_exc()
+            print('Failed to parse Kick channel info JSON.')
+            return
+        if not self.chatroom_id:
+            print('Could not find chatroom id for Kick channel.')
+            return
+
+        # Connect to Pusher
+        try:
+            import pusherclient
+        except Exception:
+            print('Missing dependency: pusherclient. Install with: python -m pip install pusherclient')
+            return
+
+        def on_connect(data):
+            try:
+                chan_name = f'private-chatrooms.{self.chatroom_id}'
+                self._pusher_channel = self._pusher.subscribe(chan_name)
+                # Bind event for new messages
+                self._pusher_channel.bind('App\\Events\\ChatMessageSentEvent', on_message)
+                print(f'Connected to Kick chatroom {self.chatroom_id}.')
+                self._connected = True
+            except Exception:
+                traceback.print_exc()
+
+        def on_message(message_data):
+            try:
+                # message_data is a JSON string from Pusher event
+                payload = json.loads(message_data)
+                # Expected fields: payload['content'], payload['sender']['username']
+                username = None
+                text = None
+                if isinstance(payload, dict):
+                    username = ((payload.get('sender') or {}).get('username')) or ((payload.get('user') or {}).get('username'))
+                    text = payload.get('content') or payload.get('message')
+                if username and text is not None:
+                    with self._lock:
+                        self.messages.append({'username': username, 'message': text})
+            except Exception:
+                traceback.print_exc()
+
+        # Initialize Pusher client
+        try:
+            self._pusher = pusherclient.Pusher(
+                key=self._pusher_key,
+                cluster=self._pusher_cluster,
+                secure=True,
+                # pusherclient accepts auth endpoint and headers for private channels
+                auth_endpoint=self._auth_endpoint,
+                custom_headers=self._headers if self._headers else None
+            )
+            self._pusher.connection.bind('pusher:connection_established', on_connect)
+            self._pusher.connect()
+            print('Connected to Kick (initializing WebSocket)...')
+        except Exception:
+            traceback.print_exc()
+            print('Failed to initialize Pusher client for Kick.')
+
+    def twitch_receive_messages(self):
+        # Mirror the interface of Twitch/YouTube
+        # Drain any accumulated messages safely
+        msgs = []
+        with self._lock:
+            if self.messages:
+                msgs = self.messages[:]
+                self.messages.clear()
+        # Throttle to match ~60 Hz polling cadence
+        time.sleep(1.0/60.0)
+        return msgs

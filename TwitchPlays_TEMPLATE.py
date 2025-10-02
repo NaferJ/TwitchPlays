@@ -22,6 +22,23 @@ YOUTUBE_CHANNEL_ID = "YOUTUBE_CHANNEL_ID_HERE"
 # Otherwise you can leave this as "None"
 YOUTUBE_STREAM_URL = None
 
+# Select your chat source: "twitch", "youtube", or "kick". Defaults to Twitch.
+STREAM_SOURCE = "twitch"
+
+# Kick settings (only used if STREAM_SOURCE == "kick")
+# Set your Kick channel username (lowercase)
+KICK_CHANNEL = "kick_username_here"
+# Kick uses Pusher for chat. Provide the app key and cluster.
+# Note: Values may change over time; inspect the Kick site network calls if needed.
+KICK_PUSHER_KEY = "YOUR_PUSHER_KEY"
+KICK_PUSHER_CLUSTER = "mt1"
+# Auth endpoint used by Kick for private chat channels (usually this URL works if cookies are provided):
+KICK_AUTH_URL = "https://kick.com/broadcasting/auth"
+# To read chat from your own account, you may need to be authenticated. Paste your browser Cookie header string and CSRF token if required.
+# Leave empty strings if unauthenticated access works for your channel.
+KICK_COOKIES = ""  # e.g. "__cf_bm=...; XSRF-TOKEN=...; kick_session=..."
+KICK_CSRF = ""
+
 ##################### MESSAGE QUEUE VARIABLES #####################
 
 # MESSAGE_RATE controls how fast we process incoming Twitch Chat messages. It's the number of seconds it will take to handle all messages in the queue.
@@ -52,12 +69,22 @@ while countdown > 0:
     countdown -= 1
     time.sleep(1)
 
-if STREAMING_ON_TWITCH:
+# Backward compatibility: If STREAM_SOURCE is not set, fall back to STREAMING_ON_TWITCH flag
+source = STREAM_SOURCE.lower() if 'STREAM_SOURCE' in globals() else ('twitch' if STREAMING_ON_TWITCH else 'youtube')
+
+if source == 'twitch':
     t = TwitchPlays_Connection.Twitch()
     t.twitch_connect(TWITCH_CHANNEL)
-else:
+elif source == 'youtube':
     t = TwitchPlays_Connection.YouTube()
     t.youtube_connect(YOUTUBE_CHANNEL_ID, YOUTUBE_STREAM_URL)
+elif source == 'kick':
+    t = TwitchPlays_Connection.Kick()
+    t.kick_connect(KICK_CHANNEL, KICK_PUSHER_KEY, KICK_PUSHER_CLUSTER, KICK_AUTH_URL, KICK_COOKIES, KICK_CSRF)
+else:
+    print(f"Unknown STREAM_SOURCE: {source}. Defaulting to twitch.")
+    t = TwitchPlays_Connection.Twitch()
+    t.twitch_connect(TWITCH_CHANNEL)
 
 def handle_message(message):
     try:
