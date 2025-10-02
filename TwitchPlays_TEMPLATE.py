@@ -23,15 +23,15 @@ YOUTUBE_CHANNEL_ID = "YOUTUBE_CHANNEL_ID_HERE"
 YOUTUBE_STREAM_URL = None
 
 # Select your chat source: "twitch", "youtube", or "kick". Defaults to Twitch.
-STREAM_SOURCE = "twitch"
+STREAM_SOURCE = "kick"
 
 # Kick settings (only used if STREAM_SOURCE == "kick")
 # Set your Kick channel username (lowercase)
-KICK_CHANNEL = "kick_username_here"
+KICK_CHANNEL = "naferj"
 # Kick uses Pusher for chat. Provide the app key and cluster.
 # Note: Values may change over time; inspect the Kick site network calls if needed.
-KICK_PUSHER_KEY = "YOUR_PUSHER_KEY"
-KICK_PUSHER_CLUSTER = "mt1"
+KICK_PUSHER_KEY = "32cbd69e4b950bf97679"
+KICK_PUSHER_CLUSTER = "us2"
 # Auth endpoint used by Kick for private chat channels (usually this URL works if cookies are provided):
 KICK_AUTH_URL = "https://kick.com/broadcasting/auth"
 # To read chat from your own account, you may need to be authenticated. Paste your browser Cookie header string and CSRF token if required.
