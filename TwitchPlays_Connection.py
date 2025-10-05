@@ -369,10 +369,25 @@ class Kick:
         self._last_message_time = None
         self._running = False
         self._chat_thread = None
+        # Track seen message IDs to prevent duplicates across polls
+        try:
+            from collections import deque
+            self._seen_ids = set()
+            self._seen_order = deque(maxlen=2000)
+        except Exception:
+            self._seen_ids = set()
+            self._seen_order = []  # fallback without maxlen
         try:
             self.debug = str(os.environ.get('KICK_DEBUG', '')).strip().lower() in ('1', 'true', 'yes', 'on')
         except Exception:
             self.debug = False
+        # Poll interval (seconds) for Kick chat; lower for faster response
+        try:
+            self._poll_interval = float(os.environ.get('KICK_POLL_INTERVAL_SECONDS', '0.25'))
+            if self._poll_interval < 0.05:
+                self._poll_interval = 0.05
+        except Exception:
+            self._poll_interval = 0.25
 
     def kick_connect(self, channel, pusher_key=None, pusher_cluster=None, auth_endpoint=None, cookies=None, csrf_token=None):
         """Connect using KickAPI (official) and start polling thread."""
@@ -410,9 +425,11 @@ class Kick:
 
             print(f"✓ Connected to Kick channel: {channel_username or self.channel_name} (ID: {self.channel_id})")
 
-            # Start from a short window in the past to avoid missing messages
+            # Start from NOW to mimic Twitch behavior (only new messages)
             from datetime import datetime, timedelta
-            self._last_message_time = datetime.utcnow() - timedelta(seconds=30)
+            self._last_message_time = datetime.utcnow()
+            # Startup grace: ignore any messages for a short window to avoid initial backlog
+            self._startup_grace_end = self._last_message_time + timedelta(seconds=int(os.environ.get("KICK_STARTUP_GRACE_SECONDS", "1")))
 
             # Start polling thread
             self._running = True
@@ -462,8 +479,20 @@ class Kick:
 
                 chat_data = None
                 try:
-                    # Pass datetime object directly as required by KickAPI
-                    chat_data = self._kick_api.chat(self.channel_id, self._last_message_time)
+                    # Pass datetime object directly as required by KickAPI, but make it exclusive with a small epsilon
+                    eps_ms = 0
+                    try:
+                        eps_ms = int(os.environ.get('KICK_SINCE_EPS_MS', '500'))
+                    except Exception:
+                        eps_ms = 500
+                    since_dt = self._last_message_time
+                    if since_dt is not None and eps_ms > 0:
+                        try:
+                            since_dt = since_dt + timedelta(milliseconds=eps_ms)
+                        except Exception:
+                            pass
+                    # Use since_dt (possibly bumped) for fetching
+                    chat_data = self._kick_api.chat(self.channel_id, since_dt or self._last_message_time)
 
                     if self.debug:
                         print(f"[KICK DEBUG] Chat API response type: {type(chat_data)}")
@@ -534,7 +563,8 @@ class Kick:
                                 break
 
                     if iterable:
-                        new_messages = []
+                        # Collect parsed messages plus IDs/timestamps for de-duplication
+                        parsed_msgs = []  # list of tuples: (msg_dict, msg_id_or_sig, msg_ts_or_None)
                         # Print first 5 raw messages as JSON
                         if self.debug:
                             try:
@@ -578,10 +608,42 @@ class Kick:
                                     if text is not None:
                                         break
 
+                                # Extract message id (best-effort)
+                                msg_id = None
+                                for id_field in ['id', 'message_id', 'uuid', 'sid']:
+                                    msg_id = getattr(msg, id_field, None)
+                                    if msg_id:
+                                        break
+
+                                # Extract timestamp (best-effort)
+                                msg_ts_raw = None
+                                for ts_field in ['created_at', 'timestamp', 'sent_at', 'time', 'date']:
+                                    msg_ts_raw = getattr(msg, ts_field, None)
+                                    if msg_ts_raw is not None:
+                                        break
+                                msg_ts = None
+                                # Normalize timestamp to datetime if possible
+                                try:
+                                    from datetime import datetime
+                                    if isinstance(msg_ts_raw, (int, float)):
+                                        msg_ts = datetime.utcfromtimestamp(msg_ts_raw)
+                                    elif isinstance(msg_ts_raw, str):
+                                        try:
+                                            # Try ISO 8601
+                                            msg_ts = datetime.fromisoformat(msg_ts_raw.replace('Z', '+00:00')).replace(tzinfo=None)
+                                        except Exception:
+                                            msg_ts = None
+                                    else:
+                                        msg_ts = None
+                                except Exception:
+                                    msg_ts = None
+
                                 if username and (text is not None):
-                                    new_messages.append({'username': username, 'message': text})
+                                    # Use raw timestamp string in signature when available to distinguish repeated votes
+                                    sig_hint = msg_ts_raw if isinstance(msg_ts_raw, str) else (str(msg_ts_raw) if msg_ts_raw is not None else None)
+                                    parsed_msgs.append(({'username': username, 'message': text, '_sig_ts': sig_hint}, msg_id, msg_ts))
                                     if self.debug:
-                                        print(f"[KICK DEBUG] ✓ New message: {username}: {text}")
+                                        print(f"[KICK DEBUG] ✓ Parsed message: {username}: {text} | id={msg_id} ts={msg_ts_raw}")
                                 else:
                                     if self.debug:
                                         print(f"[KICK DEBUG] ✗ Incomplete message - username: {username}, text: {text}")
@@ -591,12 +653,67 @@ class Kick:
                                     print(f"[KICK DEBUG] Error processing message {i}: {e}")
                                 continue
 
-                        if new_messages:
+                        # De-duplicate against seen IDs; remember IDs during grace
+                        in_grace = hasattr(self, "_startup_grace_end") and (current_time < self._startup_grace_end)
+
+                        # Helper to remember a signature with bounded memory
+                        def _remember(sig):
+                            try:
+                                self._seen_ids.add(sig)
+                                if hasattr(self, '_seen_order') and self._seen_order is not None:
+                                    # If deque with maxlen, append auto-evicts; if list fallback, manual cap
+                                    try:
+                                        self._seen_order.append(sig)
+                                    except Exception:
+                                        # list fallback
+                                        self._seen_order.append(sig)
+                                        if len(self._seen_order) > 2000:
+                                            old = self._seen_order.pop(0)
+                                            try:
+                                                self._seen_ids.discard(old)
+                                            except Exception:
+                                                pass
+                            except Exception:
+                                pass
+
+                        filtered_msgs = []
+                        latest_ts = self._last_message_time
+                        for m_dict, m_id, m_ts in parsed_msgs:
+                            ts_part = m_dict.get('_sig_ts') if isinstance(m_dict, dict) else None
+                            sig = m_id if m_id else (f"{m_dict['username']}|{m_dict['message']}|{ts_part}" if ts_part else f"{m_dict['username']}|{m_dict['message']}")
+                            if sig in getattr(self, '_seen_ids', set()):
+                                continue
+                            if in_grace:
+                                _remember(sig)
+                                # Do not enqueue during grace
+                                continue
+                            # Mark as seen and enqueue
+                            _remember(sig)
+                            filtered_msgs.append(m_dict)
+                            if m_ts is not None:
+                                try:
+                                    if latest_ts is None or m_ts > latest_ts:
+                                        latest_ts = m_ts
+                                except Exception:
+                                    pass
+
+                        if filtered_msgs:
                             with self._lock:
-                                self.messages.extend(new_messages)
-                            print(f"[KICK DEBUG] Added {len(new_messages)} new messages to queue")
+                                self.messages.extend(filtered_msgs)
+                            if self.debug:
+                                print(f"[KICK DEBUG] Added {len(filtered_msgs)} new messages to queue (after de-dup)")
                         elif self.debug:
-                            print("[KICK DEBUG] No new messages found in this poll")
+                            if in_grace:
+                                print("[KICK DEBUG] Startup grace active; remembered IDs, enqueued 0")
+                            else:
+                                print("[KICK DEBUG] No new messages found in this poll (after de-dup)")
+
+                        # Advance cursor to the latest seen timestamp to avoid overlaps
+                        try:
+                            if latest_ts is not None:
+                                self._last_message_time = latest_ts
+                        except Exception:
+                            pass
                     else:
                         if self.debug:
                             print("[KICK DEBUG] No message iterable found in chat_data")
@@ -644,13 +761,35 @@ class Kick:
                                 if fallback_msgs:
                                     with self._lock:
                                         self.messages.extend(fallback_msgs)
-                                    print(f"[KICK DEBUG] Fallback added {len(fallback_msgs)} messages to queue")
+                                    if self.debug:
+                                        print(f"[KICK DEBUG] Fallback added {len(fallback_msgs)} messages to queue")
                         except Exception as _e:
                             if self.debug:
                                 print(f"[KICK DEBUG] Fallback fetch error: {_e}")
 
-                self._last_message_time = current_time
-                time.sleep(2)
+                # Ensure cursor moves forward; keep the furthest point (apply epsilon to avoid inclusive repeats)
+                try:
+                    from datetime import timedelta as _td
+                    eps_ms2 = 0
+                    try:
+                        eps_ms2 = int(os.environ.get('KICK_SINCE_EPS_MS', '500'))
+                    except Exception:
+                        eps_ms2 = 500
+                    if 'latest_ts' in locals() and latest_ts:
+                        if self._last_message_time is None or latest_ts > self._last_message_time:
+                            self._last_message_time = latest_ts
+                    else:
+                        # No latest_ts parsed; nudge cursor forward a tiny bit to prevent stalling on inclusive boundaries
+                        if self._last_message_time is None or current_time > self._last_message_time:
+                            self._last_message_time = current_time
+                        try:
+                            if self._last_message_time is not None and eps_ms2 > 0:
+                                self._last_message_time = self._last_message_time + _td(milliseconds=eps_ms2)
+                        except Exception:
+                            pass
+                except Exception:
+                    self._last_message_time = current_time
+                time.sleep(self._poll_interval)
             except Exception as e:
                 if self.debug:
                     print(f"[KICK DEBUG] Error in chat polling: {e}")
