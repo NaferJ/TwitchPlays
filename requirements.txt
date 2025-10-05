@@ -4,3 +4,5 @@ pyautogui
 pynput
 requests
 pusherclient
+cloudscraper
+KickApi
