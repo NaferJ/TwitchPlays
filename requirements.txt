@@ -1,0 +1,8 @@
+keyboard
+pydirectinput
+pyautogui
+pynput
+requests
+pusherclient
+cloudscraper
+KickApi
