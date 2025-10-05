@@ -426,7 +426,30 @@ class Kick:
                 traceback.print_exc()
 
     def _chat_polling_loop(self):
-        from datetime import datetime
+        from datetime import datetime, timedelta
+        
+        def _serialize(obj, depth=0, max_depth=4):
+            try:
+                if depth > max_depth:
+                    return f"<max_depth_reached:{type(obj).__name__}>"
+                if obj is None or isinstance(obj, (str, int, float, bool)):
+                    return obj
+                if isinstance(obj, (list, tuple, set)):
+                    return [_serialize(x, depth+1, max_depth) for x in list(obj)]
+                if isinstance(obj, dict):
+                    return {str(k): _serialize(v, depth+1, max_depth) for k, v in obj.items()}
+                # Try vars/__dict__ for KickApi models
+                d = {}
+                for k, v in vars(obj).items():
+                    if k.startswith('_'):
+                        continue
+                    d[k] = _serialize(v, depth+1, max_depth)
+                if d:
+                    return d
+                return repr(obj)
+            except Exception:
+                return repr(obj)
+        
         while self._running:
             try:
                 if not self._kick_api or not self.channel_id:
@@ -434,21 +457,30 @@ class Kick:
                     continue
 
                 current_time = datetime.utcnow()
-                # Format timestamp string; KickApi examples accept ISO8601 Z
-                try:
-                    since_str = self._last_message_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-                except Exception:
-                    since_str = None
-
                 if self.debug:
-                    print(f"[KICK DEBUG] Fetching chat since: {since_str}")
+                    print(f"[KICK DEBUG] Fetching chat since datetime object: {self._last_message_time}")
 
                 chat_data = None
                 try:
-                    if since_str:
-                        chat_data = self._kick_api.chat(self.channel_id, since_str)
-                    else:
-                        chat_data = self._kick_api.chat(self.channel_id)
+                    # Pass datetime object directly as required by KickAPI
+                    chat_data = self._kick_api.chat(self.channel_id, self._last_message_time)
+
+                    if self.debug:
+                        print(f"[KICK DEBUG] Chat API response type: {type(chat_data)}")
+                        if hasattr(chat_data, '__dict__'):
+                            try:
+                                print(f"[KICK DEBUG] Chat API attributes: {list(vars(chat_data).keys())}")
+                            except Exception:
+                                pass
+                        # Full JSON-like dump (truncated)
+                        try:
+                            dump = _serialize(chat_data)
+                            s = json.dumps(dump, ensure_ascii=False)
+                            if len(s) > 8000:
+                                s = s[:8000] + '... [truncated]'
+                            print("[KICK DEBUG] RAW chat_data JSON:", s)
+                        except Exception as _e:
+                            print(f"[KICK DEBUG] Could not JSON-dump chat_data: {_e}")
                 except Exception as e:
                     if self.debug:
                         print(f"[KICK DEBUG] API chat fetch error: {e}")
@@ -456,39 +488,166 @@ class Kick:
                     continue
 
                 if chat_data is not None:
-                    # Expect chat_data.messages iterable
-                    try:
-                        iterable = getattr(chat_data, 'messages', None)
-                        if iterable is None and isinstance(chat_data, (list, tuple)):
-                            iterable = chat_data
-                    except Exception:
-                        iterable = None
+                    # Try multiple ways to get messages
+                    iterable = None
+
+                    # Method 1: chat_data.messages
+                    if hasattr(chat_data, 'messages'):
+                        iterable = chat_data.messages
+                        if self.debug:
+                            try:
+                                print(f"[KICK DEBUG] Found .messages attribute with {len(iterable) if iterable is not None else 0} items")
+                            except Exception:
+                                print("[KICK DEBUG] Found .messages attribute")
+
+                    # Method 2: chat_data.data or chat_data.data.messages
+                    elif hasattr(chat_data, 'data'):
+                        data_obj = chat_data.data
+                        if hasattr(data_obj, 'messages'):
+                            iterable = data_obj.messages
+                            if self.debug:
+                                try:
+                                    print(f"[KICK DEBUG] Found .data.messages with {len(iterable) if iterable is not None else 0} items")
+                                except Exception:
+                                    print("[KICK DEBUG] Found .data.messages")
+                        elif isinstance(data_obj, (list, tuple)):
+                            iterable = data_obj
+                            if self.debug:
+                                print(f"[KICK DEBUG] Using .data as list with {len(iterable)} items")
+
+                    # Method 3: Direct list/tuple
+                    elif isinstance(chat_data, (list, tuple)):
+                        iterable = chat_data
+                        if self.debug:
+                            print(f"[KICK DEBUG] Using chat_data as list with {len(iterable)} items")
+
+                    # Method 4: Try common field names
+                    else:
+                        for field_name in ['items', 'results', 'chat_messages', 'entries']:
+                            if hasattr(chat_data, field_name):
+                                iterable = getattr(chat_data, field_name)
+                                if self.debug:
+                                    try:
+                                        print(f"[KICK DEBUG] Found .{field_name} with {len(iterable) if iterable is not None else 0} items")
+                                    except Exception:
+                                        print(f"[KICK DEBUG] Found .{field_name}")
+                                break
 
                     if iterable:
                         new_messages = []
-                        for msg in iterable:
+                        # Print first 5 raw messages as JSON
+                        if self.debug:
                             try:
-                                sender = getattr(msg, 'sender', None)
-                                username = getattr(sender, 'username', None) if sender is not None else None
-                                # Support multiple possible fields for message text
-                                text = getattr(msg, 'text', None)
-                                if text is None:
-                                    text = getattr(msg, 'content', None)
-                                if text is None:
-                                    text = getattr(msg, 'message', None)
+                                preview = [_serialize(m) for m in list(iterable)[:5]]
+                                print("[KICK DEBUG] RAW first messages:", json.dumps(preview, ensure_ascii=False))
+                            except Exception as _e:
+                                print(f"[KICK DEBUG] Could not dump first messages: {_e}")
+                        for i, msg in enumerate(iterable):
+                            try:
+                                if self.debug and i == 0:
+                                    print(f"[KICK DEBUG] First message object type: {type(msg)}")
+                                    if hasattr(msg, '__dict__'):
+                                        try:
+                                            print(f"[KICK DEBUG] First message attributes: {list(vars(msg).keys())}")
+                                        except Exception:
+                                            pass
+
+                                # Try to get username
+                                username = None
+                                for user_field in ['sender', 'user', 'author', 'from']:
+                                    user_obj = getattr(msg, user_field, None)
+                                    if user_obj:
+                                        for name_field in ['username', 'name', 'display_name', 'login']:
+                                            username = getattr(user_obj, name_field, None)
+                                            if username:
+                                                break
+                                        if username:
+                                            break
+
+                                # Fallback: username might be directly on message
+                                if not username:
+                                    for name_field in ['username', 'user_name', 'author_name', 'sender_name']:
+                                        username = getattr(msg, name_field, None)
+                                        if username:
+                                            break
+
+                                # Try to get message text
+                                text = None
+                                for text_field in ['text', 'content', 'message', 'body', 'msg']:
+                                    text = getattr(msg, text_field, None)
+                                    if text is not None:
+                                        break
+
                                 if username and (text is not None):
                                     new_messages.append({'username': username, 'message': text})
                                     if self.debug:
-                                        print(f"[KICK DEBUG] New message: {username}: {text}")
+                                        print(f"[KICK DEBUG] ✓ New message: {username}: {text}")
+                                else:
+                                    if self.debug:
+                                        print(f"[KICK DEBUG] ✗ Incomplete message - username: {username}, text: {text}")
+
                             except Exception as e:
                                 if self.debug:
-                                    print(f"[KICK DEBUG] Error processing message: {e}")
+                                    print(f"[KICK DEBUG] Error processing message {i}: {e}")
                                 continue
+
                         if new_messages:
                             with self._lock:
                                 self.messages.extend(new_messages)
+                            print(f"[KICK DEBUG] Added {len(new_messages)} new messages to queue")
+                        elif self.debug:
+                            print("[KICK DEBUG] No new messages found in this poll")
+                    else:
+                        if self.debug:
+                            print("[KICK DEBUG] No message iterable found in chat_data")
+                        # Fallback: widen window to last 5 minutes using datetime object
+                        try:
                             if self.debug:
-                                print(f"[KICK DEBUG] Added {len(new_messages)} new messages to queue")
+                                print("[KICK DEBUG] Fallback: retrying chat fetch with 5-minute window...")
+                            alt_since_dt = current_time - timedelta(minutes=5)
+                            alt_data = self._kick_api.chat(self.channel_id, alt_since_dt)
+                            alt_iter = getattr(alt_data, 'messages', None)
+                            if self.debug:
+                                try:
+                                    dump_alt = _serialize(alt_data)
+                                    s2 = json.dumps(dump_alt, ensure_ascii=False)
+                                    if len(s2) > 8000:
+                                        s2 = s2[:8000] + '... [truncated]'
+                                    print("[KICK DEBUG] RAW alt chat_data JSON:", s2)
+                                except Exception:
+                                    pass
+                            if alt_iter and len(alt_iter) > 0:
+                                if self.debug:
+                                    print(f"[KICK DEBUG] Fallback returned {len(alt_iter)} messages; attempting to parse first few...")
+                                fallback_msgs = []
+                                for j, m in enumerate(alt_iter[:5]):
+                                    try:
+                                        u = None
+                                        for uf in ['sender', 'user', 'author', 'from']:
+                                            uo = getattr(m, uf, None)
+                                            if uo:
+                                                for nf in ['username', 'name', 'display_name', 'login']:
+                                                    u = getattr(uo, nf, None)
+                                                    if u:
+                                                        break
+                                            if u:
+                                                break
+                                        txt = None
+                                        for tf in ['text', 'content', 'message', 'body', 'msg']:
+                                            txt = getattr(m, tf, None)
+                                            if txt is not None:
+                                                break
+                                        if u and (txt is not None):
+                                            fallback_msgs.append({'username': u, 'message': txt})
+                                    except Exception:
+                                        continue
+                                if fallback_msgs:
+                                    with self._lock:
+                                        self.messages.extend(fallback_msgs)
+                                    print(f"[KICK DEBUG] Fallback added {len(fallback_msgs)} messages to queue")
+                        except Exception as _e:
+                            if self.debug:
+                                print(f"[KICK DEBUG] Fallback fetch error: {_e}")
 
                 self._last_message_time = current_time
                 time.sleep(2)
